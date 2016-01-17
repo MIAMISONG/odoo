@@ -12,6 +12,7 @@ class SaleOrderLine(models.Model):
     def _compute_analytic(self, domain=None):
         lines = {}
         if not domain:
+            # To filter on analyic lines linked to an expense
             domain = [('so_line', 'in', self.ids), ('amount', '<=', 0.0)]
         data = self.env['account.analytic.line'].read_group(
             domain,
@@ -51,7 +52,7 @@ class AccountAnalyticLine(models.Model):
         if not order:
             return False
         if order.state != 'sale':
-            raise UserError(_('The Sale Order %s linked to the Analytic Account must be validated before registering expenses.' % order.name))
+            raise UserError(_('The Sale Order %s linked to the Analytic Account must be validated before registering expenses.') % order.name)
 
         last_so_line = self.env['sale.order.line'].search([('order_id', '=', order.id)], order='sequence desc', limit=1)
         last_sequence = last_so_line.sequence + 1 if last_so_line else 100

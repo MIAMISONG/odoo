@@ -27,8 +27,6 @@ var LivechatButton = Widget.extend({
             default_username: _t("Visitor"),
             button_text: _t("Chat with one of our collaborators"),
             default_message: _t("How may I help you?"),
-            auto_popup: true,
-            auto_popup_timer: 10,  // auto popup after 10 seconds
         });
         this.channel = null;
         this.chat_window = null;
@@ -40,44 +38,41 @@ var LivechatButton = Widget.extend({
         var cookie = utils.get_cookie('im_livechat_session');
         var ready;
         if (!cookie) {
-            ready = session.rpc("/im_livechat/available", {channel_id: this.options.channel_id});
+            ready = session.rpc("/im_livechat/init", {channel_id: this.options.channel_id}).then(function (result) {
+                if (!result.available_for_me) {
+                    return $.Deferred().reject();
+                }
+                self.rule = result.rule;
+            });
         } else {
             var channel = JSON.parse(cookie);
-            ready = $.when(true, session.rpc("/im_livechat/history", {channel_id: channel.id, limit: 100}));
+            ready = session.rpc("/im_livechat/history", {channel_id: channel.id, limit: 100}).then(function (history) {
+                self.history = history;
+            });
         }
-        return ready.then(function (available, history) {
-            self.available = available;
-            self.history = history;
-            if (available) {
-                return self.load_qweb_template();
-            }
-        });
+        return ready.then(this.load_qweb_template.bind(this));
     },
 
     start: function () {
-        if (!this.available) {
-            this.do_hide();
-        } else {
-            this.$el.text(this.options.button_text);
-            if (this.history) {
-                _.each(this.history.reverse(), this.add_message.bind(this));
-                this.open_chat();
-            } else if (this.options.auto_popup) {
-                var auto_popup_cookie = utils.get_cookie('im_livechat_auto_popup');
-                if (!auto_popup_cookie || JSON.parse(auto_popup_cookie)){
-                    setTimeout(this.open_chat.bind(this), this.options.auto_popup_timer*1000);
+        this.$el.text(this.options.button_text);
+        if (this.history) {
+            _.each(this.history.reverse(), this.add_message.bind(this));
+            this.open_chat();
+        } else if (this.rule.action === 'auto_popup') {
+            var auto_popup_cookie = utils.get_cookie('im_livechat_auto_popup');
+            if (!auto_popup_cookie || JSON.parse(auto_popup_cookie)) {
+                this.auto_popup_timeout = setTimeout(this.open_chat.bind(this), this.rule.auto_popup_timer*1000);
+            }
+        }
+        bus.on('notification', this, function (notification) {
+            if (this.channel && (notification[0] === this.channel.uuid)) {
+                this.add_message(notification[1]);
+                this.render_messages();
+                if (this.chat_window.folded || !this.chat_window.thread.is_at_bottom()) {
+                    this.chat_window.update_unread(this.chat_window.unread_msgs+1);
                 }
             }
-            bus.on('notification', this, function (notification) {
-                if (this.channel && (notification[0] === this.channel.uuid)) {
-                    this.add_message(notification[1]);
-                    this.render_messages();
-                    if (this.chat_window.folded) {
-                        this.chat_window.update_unread(this.chat_window.unread_msgs+1);
-                    }
-                }
-            });
-        }
+        });
         return this._super();
     },
 
@@ -97,6 +92,7 @@ var LivechatButton = Widget.extend({
         var self = this;
         var cookie = utils.get_cookie('im_livechat_session');
         var def;
+        clearTimeout(this.auto_popup_timeout);
         if (cookie) {
             def = $.when(JSON.parse(cookie));
         } else {
@@ -154,6 +150,11 @@ var LivechatButton = Widget.extend({
             this.channel.state = (this.channel.state === 'open') ? 'folded' : 'open';
             utils.set_cookie('im_livechat_session', JSON.stringify(this.channel), 60*60);
         });
+        this.chat_window.thread.$el.on("scroll", null, _.debounce(function () {
+            if (self.chat_window.thread.is_at_bottom()) {
+                self.chat_window.update_unread(0);
+            }
+        }, 100));
     },
 
     close_chat: function () {
@@ -162,7 +163,12 @@ var LivechatButton = Widget.extend({
     },
 
     send_message: function (message) {
-        return session.rpc("/mail/chat_post", {uuid: this.channel.uuid, message_content: message.content});
+        var self = this;
+        return session
+            .rpc("/mail/chat_post", {uuid: this.channel.uuid, message_content: message.content})
+            .then(function () {
+                self.chat_window.thread.scroll_to();
+            });
     },
 
     add_message: function (data, options) {
@@ -195,8 +201,11 @@ var LivechatButton = Widget.extend({
     },
 
     render_messages: function () {
+        var should_scroll = !this.chat_window.folded && this.chat_window.thread.is_at_bottom();
         this.chat_window.render(this.messages);
-        this.chat_window.scrollBottom();
+        if (should_scroll) {
+            this.chat_window.thread.scroll_to();
+        }
     },
 
     send_welcome_message: function () {
@@ -212,11 +221,10 @@ var LivechatButton = Widget.extend({
     },
 
     ask_feedback: function () {
-        this.chat_window.$(".o_chat_content").empty();
         this.chat_window.$(".o_chat_input input").prop('disabled', true);
 
         var feedback = new Feedback(this, this.channel.uuid);
-        feedback.appendTo(this.chat_window.$(".o_chat_content"));
+        feedback.replace(this.chat_window.thread.$el);
 
         feedback.on("send_message", this, this.send_message);
         feedback.on("feedback_sent", this, this.close_chat);
@@ -261,9 +269,7 @@ var Feedback = Widget.extend({
         this._send_feedback({close: close_chat});
     },
 
-    on_click_no_feedback: function (ev) {
-        var content = _t("I did not rate this conversation. Bye.");
-        this.trigger("send_message", {content: content});
+    on_click_no_feedback: function () {
         this.trigger("feedback_sent"); // will close the chat
     },
 
@@ -282,9 +288,9 @@ var Feedback = Widget.extend({
         };
         return session.rpc('/im_livechat/feedback', args).then(function () {
             if (options.close) {
-                var content = _.str.sprintf(_t("I rated you with :rating_%d"), self.rating);
+                var content = _.str.sprintf(_t("Rating: :rating_%d"), self.rating);
                 if (options.reason) {
-                    content += _.str.sprintf(_t(" for the following reason: %s"), options.reason);
+                    content += " \n" + options.reason;
                 }
                 self.trigger("send_message", {content: content});
                 self.trigger("feedback_sent"); // will close the chat
